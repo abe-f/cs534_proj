@@ -14,8 +14,9 @@ unzip v2.33*
 
 # Get the dockerfile from the qidk repo
 git clone https://github.com/quic/qidk
+cd qidk
 git apply ../qidk.patch
-cd qidk/Tools/snpe_qnn_docker
+cd Tools/snpe_qnn_docker
 docker build -t snpe_qnn .
 cd ../../..
 
