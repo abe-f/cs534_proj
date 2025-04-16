@@ -9,11 +9,12 @@
 #cp ai_benchmark/assets/models/*_float.tflite models
 
 # Download SNPE SDK
-https://softwarecenter.qualcomm.com/api/download/software/sdks/Qualcomm_AI_Runtime_Community/All/2.33.0.250327/v2.33.0.250327.zip
+wget https://softwarecenter.qualcomm.com/api/download/software/sdks/Qualcomm_AI_Runtime_Community/All/2.33.0.250327/v2.33.0.250327.zip
 unzip v2.33*
 
 # Get the dockerfile from the qidk repo
 git clone https://github.com/quic/qidk
+git apply ../qidk.patch
 cd qidk/Tools/snpe_qnn_docker
 docker build -t snpe_qnn .
 cd ../../..
