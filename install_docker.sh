@@ -24,5 +24,5 @@ cd ../../..
 # The container's /work directory is mapped to the directory this command is run from.
 docker run --net host -dit --name snpe_qnn_container --mount type=bind,source="$(pwd)",target="/work/" --workdir="/work" snpe_qnn:latest
 docker exec -it snpe_qnn_container /bin/bash
-# On first time setup, this will download a bunch of stuff. For the path, say /work/qairt/v2.33.0.250327
+# On first time setup, this will download a bunch of stuff. For the path, say /work/qairt/2.33.0250327/
 # Then just say yes and press enter for everything
