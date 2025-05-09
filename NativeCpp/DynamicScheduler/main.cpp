@@ -21,6 +21,7 @@
 #include <unordered_map>
 #include <algorithm>
 #include <chrono>
+#include <thread>
 
 #include "CheckRuntime.hpp"
 #include "LoadContainer.hpp"
@@ -76,26 +77,32 @@ const int SUCCESS = 0;
 int dispatch(int argc, char **argv, std::string device_to_run)
 {
 
-    static zdl::DlSystem::Runtime_t runtime = zdl::DlSystem::Runtime_t::CPU;
+	auto start = std::chrono::high_resolution_clock::now();
+    // static zdl::DlSystem::Runtime_t runtime = zdl::DlSystem::Runtime_t::CPU;
+    zdl::DlSystem::Runtime_t runtime = zdl::DlSystem::Runtime_t::CPU;
     if (device_to_run.compare("gpu") == 0)
     {
 	runtime = zdl::DlSystem::Runtime_t::GPU;
-	// std::cout << "Runtime set to GPU in 'r'" << std::endl;
+	std::cout << "Runtime set to GPU in 'r'" << std::endl;
+	    std::cout << "Using the runtime: " << (int) runtime << " at start of dispatch (" << device_to_run <<")" << std::endl;
     }
     else if (device_to_run.compare("aip") == 0)
     {
 	runtime = zdl::DlSystem::Runtime_t::AIP_FIXED8_TF;
-	// std::cout << "Runtime set to AIP in 'r'" << std::endl;
+	std::cout << "Runtime set to AIP in 'r'" << std::endl;
+	    std::cout << "Using the runtime: " << (int) runtime << " at start of dispatch (" << device_to_run <<")" << std::endl;
     }
     else if (device_to_run.compare("dsp") == 0)
     {
 	runtime = zdl::DlSystem::Runtime_t::DSP;
-	// std::cout << "Runtime set to DSP in 'r'" << std::endl;
+	std::cout << "Runtime set to DSP in 'r'" << std::endl;
+	    std::cout << "Using the runtime: " << (int) runtime << " at start of dispatch (" << device_to_run <<")" << std::endl;
     }
     else if (device_to_run.compare("cpu") == 0)
     {
 	runtime = zdl::DlSystem::Runtime_t::CPU;
-	// std::cout << "Runtime set to CPU in 'r'" << std::endl;
+	std::cout << "Runtime set to CPU in 'r'" << std::endl;
+	    std::cout << "Using the runtime: " << (int) runtime << " at start of dispatch (" << device_to_run <<")" << std::endl;
     }
     else
     {
@@ -212,7 +219,9 @@ int dispatch(int argc, char **argv, std::string device_to_run)
 
     if (runtimeSpecified)
     {
+	    std::cout << "Using the runtime: " << (int) runtime << " before checkRuntime (" << device_to_run <<")" << std::endl;
         runtime = checkRuntime(runtime, staticQuantization);
+	    std::cout << "Using the runtime: " << (int) runtime << " after checkRuntime (" << device_to_run <<")" << std::endl;
     }
 
     std::unique_ptr<zdl::DlContainer::IDlContainer> container = loadContainerFromFile(dlc);
@@ -288,16 +297,14 @@ int dispatch(int argc, char **argv, std::string device_to_run)
     }
 
     std::unique_ptr<zdl::SNPE::SNPE> snpe;
-	auto start = std::chrono::high_resolution_clock::now();
+	auto builderstart = std::chrono::high_resolution_clock::now();
     snpe = setBuilderOptions(container, runtime, runtimeList,
 	     useUserSuppliedBuffers, platformConfig,
 	     usingInitCaching, cpuFixedPointMode, PerfProfile);
-	auto end = std::chrono::high_resolution_clock::now();
-  	auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-	std::cout << "Time taken to setBuilderOptions: " << duration.count() << " microseconds" << std::endl;
-
-
-    std::cout << "Using the runtime: " << (int) runtime << std::endl;
+	auto builderend = std::chrono::high_resolution_clock::now();
+  	auto builderduration = std::chrono::duration_cast<std::chrono::microseconds>(builderend - builderstart);
+	std::cout << "Time taken to setBuilderOptions: " << builderduration.count() << " microseconds (" << device_to_run << ")" << std::endl;
+    std::cout << "Using the runtime: " << (int) runtime << "(" << device_to_run <<")" << std::endl;
 
     if (snpe == nullptr)
     {
@@ -465,11 +472,11 @@ int dispatch(int argc, char **argv, std::string device_to_run)
                     return EXIT_FAILURE;
                 }
                 // Execute the input tensor on the model with SNPE
-	auto start = std::chrono::high_resolution_clock::now();
+	auto executestart = std::chrono::high_resolution_clock::now();
                 execStatus = snpe->execute(inputTensor.get(), outputTensorMap);
-	auto end = std::chrono::high_resolution_clock::now();
-  	auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-	std::cout << "Time taken to execute: " << duration.count() << " microseconds" << std::endl;
+	auto executeend = std::chrono::high_resolution_clock::now();
+  	auto executeduration = std::chrono::duration_cast<std::chrono::microseconds>(executeend - executestart);
+	std::cout << "Time taken to execute: " << executeduration.count() << " microseconds" << std::endl;
             }
             else
             {
@@ -503,6 +510,10 @@ int dispatch(int argc, char **argv, std::string device_to_run)
 
     // Terminate Logging
     zdl::SNPE::SNPEFactory::terminateLogging();
+
+	auto end = std::chrono::high_resolution_clock::now();
+  	auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+	std::cout << "Total time taken: " << duration.count() << " microseconds for " << device_to_run << std::endl;
 
     snpe.reset();
     return SUCCESS;
@@ -681,10 +692,10 @@ int main(int argc, char **argv)
             for (auto &runtimeStr : runtimeStrVector)
             {
                 // std::cout<<runtimeStr<<std::endl;
-                zdl::DlSystem::Runtime_t runtime = zdl::DlSystem::RuntimeList::stringToRuntime(runtimeStr.c_str());
-                if (runtime != zdl::DlSystem::Runtime_t::UNSET)
+                zdl::DlSystem::Runtime_t eachruntime = zdl::DlSystem::RuntimeList::stringToRuntime(runtimeStr.c_str());
+                if (eachruntime != zdl::DlSystem::Runtime_t::UNSET)
                 {
-                    bool ret = runtimeList.add(runtime);
+                    bool ret = runtimeList.add(eachruntime);
                     if (ret == false)
                     {
                         std::cerr << zdl::DlSystem::getLastErrorString() << std::endl;
@@ -724,24 +735,24 @@ int main(int argc, char **argv)
 
 
 	std::cout << "Dispatching to main code with cpu" << std::endl;
-	auto start = std::chrono::high_resolution_clock::now();
-	dispatch(argc, argv, "cpu");
-	auto end = std::chrono::high_resolution_clock::now();
-  	auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-	std::cout << "Total time taken: " << duration.count() << " microseconds" << std::endl;
+	std::thread cpu_thread(dispatch, argc, argv, "cpu");
+	//cpu_thread.join();
 
 	std::cout << "Dispatching to main code with gpu" << std::endl;
-	start = std::chrono::high_resolution_clock::now();
-	dispatch(argc, argv, "gpu");
-	end = std::chrono::high_resolution_clock::now();
-  	duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-	std::cout << "Total time taken: " << duration.count() << " microseconds" << std::endl;
+	// dispatch(argc, argv, "gpu");
+	std::thread gpu_thread(dispatch, argc, argv, "gpu");
+	//gpu_thread.join();
 
 	std::cout << "Dispatching to main code with dsp" << std::endl;
-	start = std::chrono::high_resolution_clock::now();
-	dispatch(argc, argv, "dsp");
-	end = std::chrono::high_resolution_clock::now();
-  	duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-	std::cout << "Total time taken: " << duration.count() << " microseconds" << std::endl;
+	// dispatch(argc, argv, "dsp");
+	std::thread dsp_thread(dispatch, argc, argv, "dsp");
+	//dsp_thread.join();
+
+	cpu_thread.join();
+	std::cout << "CPU done" << std::endl;
+	gpu_thread.join();
+	std::cout << "GPU done" << std::endl;
+	dsp_thread.join();
+	std::cout << "DSP done" << std::endl;
 }
 

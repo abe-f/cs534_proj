@@ -21,7 +21,7 @@ zdl::DlSystem::Runtime_t checkRuntime(zdl::DlSystem::Runtime_t runtime, bool &st
 {
     static zdl::DlSystem::Version_t Version = zdl::SNPE::SNPEFactory::getLibraryVersion();
 
-    std::cout << "SNPE Version: " << Version.asString().c_str() << std::endl; //Print Version number
+    // std::cout << "SNPE Version: " << Version.asString().c_str() << std::endl; //Print Version number
 
    if((runtime != zdl::DlSystem::Runtime_t::DSP) && staticQuantization)
    {
