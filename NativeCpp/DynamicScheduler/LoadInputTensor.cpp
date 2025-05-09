@@ -38,7 +38,7 @@ std::unique_ptr<zdl::DlSystem::ITensor> loadInputTensor (std::unique_ptr<zdl::SN
     std::vector<float> inputVec;
     for(size_t i=0; i<fileLines.size(); i++) {
         std::string filePath(fileLines[i]);
-        std::cout << "Processing DNN Input: " << filePath << "\n";
+	// std::cout << "Processing DNN Input: " << filePath << "\n";
         std::vector<float> loadedFile = loadFloatDataFile(filePath);
         inputVec.insert(inputVec.end(), loadedFile.begin(), loadedFile.end());
     }

@@ -22,6 +22,8 @@
 #include <algorithm>
 #include <chrono>
 #include <thread>
+#include <queue>
+#include <mutex>
 
 #include "CheckRuntime.hpp"
 #include "LoadContainer.hpp"
@@ -57,9 +59,7 @@ const int FAILURE = 1;
 const int SUCCESS = 0;
 
     // Command line arguments
-    static std::string dlc = "";
     static std::string OutputDir = "./output/";
-    const char *inputFile = "";
     std::string bufferTypeStr = "ITENSOR";
     std::string userBufferSourceStr = "CPUBUFFER";
     std::string staticQuantizationStr = "false";
@@ -74,35 +74,62 @@ const int SUCCESS = 0;
     static std::string perfProfileStr = "default";
     static zdl::DlSystem::PerformanceProfile_t PerfProfile = zdl::DlSystem::PerformanceProfile_t::BALANCED;;
 
-int dispatch(int argc, char **argv, std::string device_to_run)
+struct eachRequest {
+	/*
+	 * Struct to store the details about a specific request
+	 */
+	int id;
+	std::string dlc_file; // Just use the quantized DLC file for all 3 CPU/GPU/NPU
+	const char *inputFile;
+};
+
+std::queue<eachRequest> central_request_queue;
+std::mutex central_request_queue_mutex;
+std::queue<eachRequest> cpu_request_queue;
+std::mutex cpu_request_queue_mutex;
+std::queue<eachRequest> gpu_request_queue;
+std::mutex gpu_request_queue_mutex;
+std::queue<eachRequest> dsp_request_queue;
+std::mutex dsp_request_queue_mutex;
+
+int dispatch(std::string device_to_run, eachRequest dispatchRequest)
 {
+	/*
+	 * The function that runs eachRequest on the device specified by device_to_run (cpu/gpu/dsp)
+	 * eachRequest specifies the actual DLC file to run, and the input file list
+	 */
+
+	std::string dlc = dispatchRequest.dlc_file;
+       	const char *inputFile = dispatchRequest.inputFile;
 
 	auto start = std::chrono::high_resolution_clock::now();
+    // static std::string dlc = "";
+    // const char *inputFile = "";
     // static zdl::DlSystem::Runtime_t runtime = zdl::DlSystem::Runtime_t::CPU;
     zdl::DlSystem::Runtime_t runtime = zdl::DlSystem::Runtime_t::CPU;
     if (device_to_run.compare("gpu") == 0)
     {
 	runtime = zdl::DlSystem::Runtime_t::GPU;
-	std::cout << "Runtime set to GPU in 'r'" << std::endl;
-	    std::cout << "Using the runtime: " << (int) runtime << " at start of dispatch (" << device_to_run <<")" << std::endl;
+	// std::cout << "Runtime set to GPU in 'r'" << std::endl;
+	    // std::cout << "Using the runtime: " << (int) runtime << " at start of dispatch (" << device_to_run <<")" << std::endl;
     }
     else if (device_to_run.compare("aip") == 0)
     {
 	runtime = zdl::DlSystem::Runtime_t::AIP_FIXED8_TF;
-	std::cout << "Runtime set to AIP in 'r'" << std::endl;
-	    std::cout << "Using the runtime: " << (int) runtime << " at start of dispatch (" << device_to_run <<")" << std::endl;
+	// std::cout << "Runtime set to AIP in 'r'" << std::endl;
+	   // std::cout << "Using the runtime: " << (int) runtime << " at start of dispatch (" << device_to_run <<")" << std::endl;
     }
     else if (device_to_run.compare("dsp") == 0)
     {
 	runtime = zdl::DlSystem::Runtime_t::DSP;
-	std::cout << "Runtime set to DSP in 'r'" << std::endl;
-	    std::cout << "Using the runtime: " << (int) runtime << " at start of dispatch (" << device_to_run <<")" << std::endl;
+	// std::cout << "Runtime set to DSP in 'r'" << std::endl;
+	    // std::cout << "Using the runtime: " << (int) runtime << " at start of dispatch (" << device_to_run <<")" << std::endl;
     }
     else if (device_to_run.compare("cpu") == 0)
     {
 	runtime = zdl::DlSystem::Runtime_t::CPU;
-	std::cout << "Runtime set to CPU in 'r'" << std::endl;
-	    std::cout << "Using the runtime: " << (int) runtime << " at start of dispatch (" << device_to_run <<")" << std::endl;
+	// std::cout << "Runtime set to CPU in 'r'" << std::endl;
+	   //  std::cout << "Using the runtime: " << (int) runtime << " at start of dispatch (" << device_to_run <<")" << std::endl;
     }
     else
     {
@@ -219,9 +246,9 @@ int dispatch(int argc, char **argv, std::string device_to_run)
 
     if (runtimeSpecified)
     {
-	    std::cout << "Using the runtime: " << (int) runtime << " before checkRuntime (" << device_to_run <<")" << std::endl;
+	    // std::cout << "Using the runtime: " << (int) runtime << " before checkRuntime (" << device_to_run <<")" << std::endl;
         runtime = checkRuntime(runtime, staticQuantization);
-	    std::cout << "Using the runtime: " << (int) runtime << " after checkRuntime (" << device_to_run <<")" << std::endl;
+	    // std::cout << "Using the runtime: " << (int) runtime << " after checkRuntime (" << device_to_run <<")" << std::endl;
     }
 
     std::unique_ptr<zdl::DlContainer::IDlContainer> container = loadContainerFromFile(dlc);
@@ -303,7 +330,7 @@ int dispatch(int argc, char **argv, std::string device_to_run)
 	     usingInitCaching, cpuFixedPointMode, PerfProfile);
 	auto builderend = std::chrono::high_resolution_clock::now();
   	auto builderduration = std::chrono::duration_cast<std::chrono::microseconds>(builderend - builderstart);
-	std::cout << "Time taken to setBuilderOptions: " << builderduration.count() << " microseconds (" << device_to_run << ")" << std::endl;
+	// std::cout << "Time taken to setBuilderOptions: " << builderduration.count() << " microseconds (" << device_to_run << ")" << std::endl;
     std::cout << "Using the runtime: " << (int) runtime << "(" << device_to_run <<")" << std::endl;
 
     if (snpe == nullptr)
@@ -519,6 +546,100 @@ int dispatch(int argc, char **argv, std::string device_to_run)
     return SUCCESS;
 }
 
+void central_queue_to_device_queue() {
+
+/*
+ * Runs till the central_request_queue is empty
+ * For each entry in the central queue, check the pending time for the current requests in the CPU/GPU/NPU queue
+ * Dispatch the entry from the central queue into the device queue that has the lowest pending time
+ */
+
+	while(true) {
+		central_request_queue_mutex.lock();
+		if (central_request_queue.empty()) {
+			break;
+		} else {
+			eachRequest front_request = central_request_queue.front();
+			central_request_queue.pop();
+			central_request_queue_mutex.unlock();
+
+			cpu_request_queue_mutex.lock();gpu_request_queue_mutex.lock();dsp_request_queue_mutex.lock();
+			// TODO: hardcoding these times for the inception model. Need to add an array to check front_request.dlc thingy to check
+			float cpu_pending_time = cpu_request_queue.size()*6e5;
+			float gpu_pending_time = gpu_request_queue.size()*12e5;
+			float dsp_pending_time = dsp_request_queue.size()*14e5;
+			    if (cpu_pending_time <= gpu_pending_time && cpu_pending_time <= dsp_pending_time) {
+				cpu_request_queue.push(front_request);
+				std::cout << "CPU/GPU/NPU pending times: " << cpu_pending_time << "<- " << gpu_pending_time << " " << dsp_pending_time << std::endl;
+			    } else if (gpu_pending_time <= cpu_pending_time && gpu_pending_time <= dsp_pending_time) {
+				gpu_request_queue.push(front_request);
+				std::cout << "CPU/GPU/NPU pending times: " << cpu_pending_time << " " << gpu_pending_time << "<- " << dsp_pending_time << std::endl;
+			    } else {
+				dsp_request_queue.push(front_request);
+				std::cout << "CPU/GPU/NPU pending times: " << cpu_pending_time << " " << gpu_pending_time << " " << dsp_pending_time << "<-" << std::endl;
+			    }
+			cpu_request_queue_mutex.unlock();gpu_request_queue_mutex.unlock();dsp_request_queue_mutex.unlock();
+		}
+	}
+}
+
+void cpu_dispatch() {
+	/*
+	 * Run till the cpu_request_queue is empty and dispatch each request to the cpu 
+	 */
+	while(true) { // run till cpu_request_queue has elements
+		cpu_request_queue_mutex.lock();
+		if (cpu_request_queue.empty()) {
+			cpu_request_queue_mutex.unlock();
+			break;
+		} else {
+			eachRequest frontRequest = cpu_request_queue.front();
+			cpu_request_queue.pop();
+			cpu_request_queue_mutex.unlock();
+			dispatch("cpu", frontRequest);
+			// TODO: depending on what request you just handled, add another request to the central queue for the multi-model chaining
+		}
+	}
+}
+
+void gpu_dispatch() {
+	/*
+	 * Run till the gpu_request_queue is empty and dispatch each request to the gpu
+	 */
+	while(true) { // run till gpu_request_queue has elements
+		gpu_request_queue_mutex.lock();
+		if (gpu_request_queue.empty()) {
+			gpu_request_queue_mutex.unlock();
+			break;
+		} else {
+			eachRequest frontRequest = gpu_request_queue.front();
+			gpu_request_queue.pop();
+			gpu_request_queue_mutex.unlock();
+			dispatch("gpu", frontRequest);
+			// TODO: depending on what request you just handled, add another request to the central queue for the multi-model chaining
+		}
+	}
+}
+
+void dsp_dispatch() {
+	/*
+	 * Run till the dsp_request_queue is empty and dispatch each request to the dsp
+	 */
+	while(true) { // run till dsp_request_queue has elements
+		dsp_request_queue_mutex.lock();
+		if (dsp_request_queue.empty()) {
+			dsp_request_queue_mutex.unlock();
+			break;
+		} else {
+			eachRequest frontRequest = dsp_request_queue.front();
+			dsp_request_queue.pop();
+			dsp_request_queue_mutex.unlock();
+			dispatch("dsp", frontRequest);
+			// TODO: depending on what request you just handled, add another request to the central queue for the multi-model chaining
+		}
+	}
+}
+
 int main(int argc, char **argv)
 {
 
@@ -646,10 +767,10 @@ int main(int argc, char **argv)
 
             std::exit(SUCCESS);
         case 'i':
-            inputFile = optarg;
+            // inputFile = optarg;
             break;
         case 'd':
-            dlc = optarg;
+            // dlc = optarg;
             break;
         case 'o':
             OutputDir = optarg;
@@ -734,25 +855,29 @@ int main(int argc, char **argv)
     }
 
 
-	std::cout << "Dispatching to main code with cpu" << std::endl;
-	std::thread cpu_thread(dispatch, argc, argv, "cpu");
-	//cpu_thread.join();
+	// Populating the central_request_queue with a few requests to start with
+	central_request_queue_mutex.lock();
+	for (int i = 0; i < 30; i++) {
+		eachRequest inception_request = {i, "inception_v3_quantized.dlc", "target_raw_list.txt"};	
+		central_request_queue.push(inception_request);
+	}
+	central_request_queue_mutex.unlock();
 
-	std::cout << "Dispatching to main code with gpu" << std::endl;
-	// dispatch(argc, argv, "gpu");
-	std::thread gpu_thread(dispatch, argc, argv, "gpu");
-	//gpu_thread.join();
+	// Start the thread that takes requests from the central queue to dispatch it to the device queues
+	std::thread central_to_device_thread(central_queue_to_device_queue);
+	std::this_thread::sleep_for(std::chrono::milliseconds(2000)); // Giving this thread some time to be able to populate the device queues
 
-	std::cout << "Dispatching to main code with dsp" << std::endl;
-	// dispatch(argc, argv, "dsp");
-	std::thread dsp_thread(dispatch, argc, argv, "dsp");
-	//dsp_thread.join();
+	std::thread cpu_dispatch_thread(cpu_dispatch);
+	std::thread gpu_dispatch_thread(gpu_dispatch);
+	std::thread dsp_dispatch_thread(dsp_dispatch);
 
-	cpu_thread.join();
-	std::cout << "CPU done" << std::endl;
-	gpu_thread.join();
-	std::cout << "GPU done" << std::endl;
-	dsp_thread.join();
-	std::cout << "DSP done" << std::endl;
+	// TODO: have to add another thread that keeps adding requests to the central queue at a constant rate
+
+	central_to_device_thread.join();
+	cpu_dispatch_thread.join();
+	gpu_dispatch_thread.join();
+	dsp_dispatch_thread.join();
+
+
 }
 
