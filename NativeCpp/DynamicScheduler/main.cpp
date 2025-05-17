@@ -1,883 +1,310 @@
-//==============================================================================
-//
-//  Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
-//  All rights reserved.
-//  Confidential and Proprietary - Qualcomm Technologies, Inc.
-//
-//==============================================================================
-//
-// This file contains an example application that loads and executes a neural
-// network using the SNPE C++ API and saves the layer output to a file.
-// Inputs to and outputs from the network are conveyed in binary form as single
-// precision floating point values.
-//
-#include <cstring>
-#include <iostream>
-#include <fstream>
-#include <cstdlib>
-#include <vector>
-#include <string>
-#include <iterator>
-#include <unordered_map>
-#include <algorithm>
-#include <chrono>
-#include <thread>
-#include <queue>
-#include <mutex>
+// realtime_scheduler.cpp
+// build: g++ -std=c++14 -pthread … -lsnpe_*
+#include <SNPE/SNPE.hpp>
+#include <SNPE/SNPEFactory.hpp>
 
-#include "CheckRuntime.hpp"
-#include "LoadContainer.hpp"
-#include "LoadUDOPackage.hpp"
-#include "SetBuilderOptions.hpp"
-#include "LoadInputTensor.hpp"
-#include "CreateUserBuffer.hpp"
-#include "PreprocessInput.hpp"
-#include "SaveOutputTensor.hpp"
-#include "Util.hpp"
-#include "DlSystem/DlError.hpp"
-#include "DlSystem/RuntimeList.hpp"
-
-#include "DlSystem/UserBufferMap.hpp"
-#include "DlSystem/IUserBuffer.hpp"
-#include "DlSystem/SNPEPerfProfile.h"
 #include "DlContainer/IDlContainer.hpp"
-#include "SNPE/SNPE.hpp"
-#include "SNPE/SNPEFactory.hpp"
-#include "DiagLog/IDiagLog.hpp"
+#include "DlSystem/SNPEPerfProfile.h"
+#include "LoadContainer.hpp"
+#include "LoadInputTensor.hpp"
+#include "PreprocessInput.hpp"
+#include "SetBuilderOptions.hpp"
 
-#ifndef _WIN32
-#include <getopt.h>
-#else
-#include "GetOpt.hpp"
-using namespace WinOpt;
-#endif
-/* Windows Modification
- * Replace <getopt.h> to <GetOpt.hpp> and refactor the "Process command line arguments" part
- */
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <fstream>
+#include <iostream>
+#include <mutex>
+#include <queue>
+#include <random>
+#include <set>
+#include <thread>
+#include <unordered_map>
+#include <vector>
 
-const int FAILURE = 1;
-const int SUCCESS = 0;
+#include <pthread.h>
+#include <sched.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
-    // Command line arguments
-    static std::string OutputDir = "./output/";
-    std::string bufferTypeStr = "ITENSOR";
-    std::string userBufferSourceStr = "CPUBUFFER";
-    std::string staticQuantizationStr = "false";
-    static zdl::DlSystem::RuntimeList runtimeList;
-    bool runtimeSpecified = false;
-    bool execStatus = false;
-    bool usingInitCaching = false;
-    bool staticQuantization = false;
-    bool cpuFixedPointMode = false;
-    std::string UdoPackagePath = "";
-    bool useNativeInputFiles = false;
-    static std::string perfProfileStr = "default";
-    static zdl::DlSystem::PerformanceProfile_t PerfProfile = zdl::DlSystem::PerformanceProfile_t::BALANCED;;
+using zdl::DlSystem::Runtime_t;
+using Clock = std::chrono::steady_clock;
 
-struct eachRequest {
-	/*
-	 * Struct to store the details about a specific request
-	 */
-	int id;
-	std::string dlc_file; // Just use the quantized DLC file for all 3 CPU/GPU/NPU
-	const char *inputFile;
+/* ───────────────────────────────── workload definitions ────────────────────────── */
+struct ModelSpec { std::string dlc; double fps, prob; std::string list; };
+using Scenario   = std::vector<ModelSpec>;
+
+/* add / edit scenarios here ------------------------------------------------------- */
+static const std::unordered_map<std::string, Scenario> kScenarios = {
+    { "AR_Assistant", {
+        { "models/KD_res8_narrow_quant.dlc",     3.0, 1.00, "input_lists/KD_res8_narrow.txt" },
+        { "models/ASR_EM_24L_quant.dlc",        3.0, 0.50, "input_lists/ASR_EM_24L.txt"     },
+        { "models/SS_HRViT_b1_quant.dlc",      10.0, 1.00, "input_lists/SS_HRViT_b1_quant.txt" },
+        { "models/DE_midas_v21_small_quant.dlc",30.0, 1.00, "input_lists/DE_midas_v21_small.txt" },
+        { "models/OD_D2go_FasterRCNN_quant.dlc",10.0, 1.00, "input_lists/OD_D2go_FasterRCNN.txt"}
+    }}
 };
 
-std::queue<eachRequest> central_request_queue;
-std::mutex central_request_queue_mutex;
-std::queue<eachRequest> cpu_request_queue;
-std::mutex cpu_request_queue_mutex;
-std::queue<eachRequest> gpu_request_queue;
-std::mutex gpu_request_queue_mutex;
-std::queue<eachRequest> dsp_request_queue;
-std::mutex dsp_request_queue_mutex;
+static const std::vector<double> kScales = {0.5, 1.0, 1.5, 2.0};
 
-int dispatch(std::string device_to_run, eachRequest dispatchRequest)
+/* ───────────────────────────────── scheduling policies ─────────────────────────── */
+enum class Policy : int { CPU_ONLY, GPU_ONLY, DSP_ONLY, RANDOM, JSQ, DYNAMIC };
+static const char* kPolName[] = { "CPU_ONLY","GPU_ONLY","DSP_ONLY","RANDOM","JSQ","DYNAMIC" };
+
+/* ───────────────────────────────── global containers ───────────────────────────── */
+static std::atomic<bool> gStop{false};
+static std::atomic<int > gInFlight{0};
+
+struct RtCtx  { std::unique_ptr<zdl::SNPE::SNPE> snpe;
+                std::unique_ptr<zdl::DlSystem::ITensor> input; };
+struct ModelCtx { std::array<RtCtx,3> rt; };                // 0=CPU 1=GPU 2=DSP
+
+static std::unordered_map<std::string, ModelCtx>               gModelCtx;
+static std::unordered_map<std::string, std::vector<Runtime_t>> gAvailRt;
+
+/* ───────────────────────────────── lock‑free queues per runtime ─────────────────── */
+struct Request { const ModelSpec* ms; Runtime_t rt; Clock::time_point dl; };
+
+struct TSQueue {
+    std::queue<Request> q; std::mutex m; std::condition_variable cv;
+    void push(const Request& r){ { std::lock_guard<std::mutex> lk(m); q.push(r);} cv.notify_one(); }
+    bool pop(Request& r){
+        std::unique_lock<std::mutex> lk(m);
+        cv.wait(lk,[&]{ return !q.empty() || gStop.load(); });
+        if(q.empty()) return false;
+        r = q.front(); q.pop(); return true;
+    }
+    void clear(){ std::lock_guard<std::mutex> lk(m); std::queue<Request>().swap(q); }
+    size_t size(){ std::lock_guard<std::mutex> lk(m); return q.size(); }
+};
+static TSQueue queues[3];
+
+/* ───────────────────────────────── latency tracker for DYNAMIC ─────────────────── */
+struct LatRec { double avg = 1.0; void upd(double v){ avg = 0.9*avg + 0.1*v; } };
+static std::unordered_map<std::string, std::array<LatRec,3>> gLat;
+
+/* ───────────────────────────────── helpers ─────────────────────────────────────── */
+inline const char* rtName(Runtime_t r){ return r==Runtime_t::CPU?"CPU":r==Runtime_t::GPU?"GPU":"DSP"; }
+inline void pin(int core){ cpu_set_t s; CPU_ZERO(&s); CPU_SET(core,&s);
+                           sched_setaffinity(static_cast<pid_t>(syscall(SYS_gettid)),sizeof(s),&s); }
+inline bool exists(const std::string& p){ return access(p.c_str(),F_OK)==0; }
+
+/* prepare one ITensor (robust) ---------------------------------------------------- */
+static std::unique_ptr<zdl::DlSystem::ITensor>
+prepInput(std::unique_ptr<zdl::SNPE::SNPE>& snpe, const std::string& list)
 {
-	/*
-	 * The function that runs eachRequest on the device specified by device_to_run (cpu/gpu/dsp)
-	 * eachRequest specifies the actual DLC file to run, and the input file list
-	 */
+    auto batches = preprocessInput(list.c_str(),1);
+    if(batches.empty()) throw std::runtime_error("empty input list "+list);
 
-	std::string dlc = dispatchRequest.dlc_file;
-       	const char *inputFile = dispatchRequest.inputFile;
+    const auto& namesOpt = snpe->getInputTensorNames();
+    if(!namesOpt) throw std::runtime_error("null input‑name ptr");
+    const auto& names = *namesOpt;
+    if(names.size()!=1)
+        throw std::runtime_error("model declares "+std::to_string(names.size())+" inputs");
 
-	auto start = std::chrono::high_resolution_clock::now();
-    // static std::string dlc = "";
-    // const char *inputFile = "";
-    // static zdl::DlSystem::Runtime_t runtime = zdl::DlSystem::Runtime_t::CPU;
-    zdl::DlSystem::Runtime_t runtime = zdl::DlSystem::Runtime_t::CPU;
-    if (device_to_run.compare("gpu") == 0)
-    {
-	runtime = zdl::DlSystem::Runtime_t::GPU;
-	// std::cout << "Runtime set to GPU in 'r'" << std::endl;
-	    // std::cout << "Using the runtime: " << (int) runtime << " at start of dispatch (" << device_to_run <<")" << std::endl;
-    }
-    else if (device_to_run.compare("aip") == 0)
-    {
-	runtime = zdl::DlSystem::Runtime_t::AIP_FIXED8_TF;
-	// std::cout << "Runtime set to AIP in 'r'" << std::endl;
-	   // std::cout << "Using the runtime: " << (int) runtime << " at start of dispatch (" << device_to_run <<")" << std::endl;
-    }
-    else if (device_to_run.compare("dsp") == 0)
-    {
-	runtime = zdl::DlSystem::Runtime_t::DSP;
-	// std::cout << "Runtime set to DSP in 'r'" << std::endl;
-	    // std::cout << "Using the runtime: " << (int) runtime << " at start of dispatch (" << device_to_run <<")" << std::endl;
-    }
-    else if (device_to_run.compare("cpu") == 0)
-    {
-	runtime = zdl::DlSystem::Runtime_t::CPU;
-	// std::cout << "Runtime set to CPU in 'r'" << std::endl;
-	   //  std::cout << "Using the runtime: " << (int) runtime << " at start of dispatch (" << device_to_run <<")" << std::endl;
-    }
-    else
-    {
-	std::cerr << "The runtime option provide is not valid. Defaulting to the CPU runtime." << std::endl;
-	std::cout << "Runtime set to CPU as fallback in 'r'" << std::endl;
-    }
-
-    enum
-    {
-        UNKNOWN,
-        USERBUFFER_FLOAT,
-        USERBUFFER_TF8,
-        ITENSOR,
-        USERBUFFER_TF16
-    };
-    enum
-    {
-        CPUBUFFER,
-        GLBUFFER
-    };
-    // Check if given arguments represent valid files
-    std::ifstream dlcFile(dlc);
-    std::ifstream inputList(inputFile);
-    if (!dlcFile || !inputList)
-    {
-        std::cout << "Input list or dlc file not valid. Please ensure that you have provided a valid input list and dlc for processing. Run snpe-sample with the -h flag for more details" << std::endl;
-        return EXIT_FAILURE;
-    }
-
-    // Check if given buffer type is valid
-    int bufferType;
-    int bitWidth = 0;
-    if (bufferTypeStr == "USERBUFFER_FLOAT")
-    {
-        bufferType = USERBUFFER_FLOAT;
-    }
-    else if (bufferTypeStr == "USERBUFFER_TF8")
-    {
-        bufferType = USERBUFFER_TF8;
-        bitWidth = 8;
-    }
-    else if (bufferTypeStr == "USERBUFFER_TF16")
-    {
-        bufferType = USERBUFFER_TF16;
-        bitWidth = 16;
-    }
-    else if (bufferTypeStr == "ITENSOR")
-    {
-        bufferType = ITENSOR;
-    }
-    else
-    {
-        std::cout << "Buffer type is not valid. Please run snpe-sample with the -h flag for more details" << std::endl;
-        return EXIT_FAILURE;
-    }
-
-    // Check if given user buffer source type is valid
-    int userBufferSourceType = CPUBUFFER;
-    // CPUBUFFER / GLBUFFER supported only for USERBUFFER_FLOAT
-    if (bufferType == USERBUFFER_FLOAT)
-    {
-        if (userBufferSourceStr == "CPUBUFFER")
-        {
-            userBufferSourceType = CPUBUFFER;
-        }
-        else if (userBufferSourceStr == "GLBUFFER")
-        {
-#ifndef ENABLE_GL_BUFFER
-            std::cout << "GLBUFFER mode is only supported on Android OS" << std::endl;
-            return EXIT_FAILURE;
-#endif
-            userBufferSourceType = GLBUFFER;
-        }
-        else
-        {
-            std::cout
-                << "Source of user buffer type is not valid. Please run snpe-sample with the -h flag for more details"
-                << std::endl;
-            return EXIT_FAILURE;
-        }
-    }
-
-    if (staticQuantizationStr == "true")
-    {
-        staticQuantization = true;
-    }
-    else if (staticQuantizationStr == "false")
-    {
-        staticQuantization = false;
-    }
-    else
-    {
-        std::cout << "Static quantization value is not valid. Please run snpe-sample with the -h flag for more details"
-                  << std::endl;
-        return EXIT_FAILURE;
-    }
-
-    // Check if both runtimelist and runtime are passed in
-    if (runtimeSpecified && runtimeList.empty() == false)
-    {
-        std::cout << "Invalid option cannot mix runtime order -l with runtime -r " << std::endl;
-        std::exit(FAILURE);
-    }
-
-
-    // Open the DL container that contains the network to execute.
-    // Create an instance of the SNPE network from the now opened container.
-    // The factory functions provided by SNPE allow for the specification
-    // of which layers of the network should be returned as output and also
-    // if the network should be run on the CPU or GPU.
-    // The runtime availability API allows for runtime support to be queried.
-    // If a selected runtime is not available, we will issue a warning and continue,
-    // expecting the invalid configuration to be caught at SNPE network creation.
-
-    if (runtimeSpecified)
-    {
-	    // std::cout << "Using the runtime: " << (int) runtime << " before checkRuntime (" << device_to_run <<")" << std::endl;
-        runtime = checkRuntime(runtime, staticQuantization);
-	    // std::cout << "Using the runtime: " << (int) runtime << " after checkRuntime (" << device_to_run <<")" << std::endl;
-    }
-
-    std::unique_ptr<zdl::DlContainer::IDlContainer> container = loadContainerFromFile(dlc);
-    if (container == nullptr)
-    {
-        std::cerr << "Error while opening the container file." << std::endl;
-        return EXIT_FAILURE;
-    }
-
-    bool useUserSuppliedBuffers = (bufferType == USERBUFFER_FLOAT || bufferType == USERBUFFER_TF8 || bufferType == USERBUFFER_TF16);
-
-    zdl::DlSystem::PlatformConfig platformConfig;
-#ifdef ENABLE_GL_BUFFER
-    if (userBufferSourceType == GLBUFFER)
-    {
-        platformConfig.SetIsUserGLBuffer(true);
-    }
-#endif
-
-    // load UDO package
-    if (false == loadUDOPackage(UdoPackagePath))
-    {
-        std::cerr << "Failed to load UDO Package(s)." << std::endl;
-        return EXIT_FAILURE;
-    }
-
-    if (perfProfileStr == "default" || perfProfileStr == "balanced")
-    {
-        PerfProfile = zdl::DlSystem::PerformanceProfile_t::BALANCED;
-    }
-    else if (perfProfileStr == "high_performance")
-    {
-        PerfProfile = zdl::DlSystem::PerformanceProfile_t::HIGH_PERFORMANCE;
-    }
-    else if (perfProfileStr == "power_saver")
-    {
-        PerfProfile = zdl::DlSystem::PerformanceProfile_t::POWER_SAVER;
-    }
-    else if (perfProfileStr == "system_settings")
-    {
-        PerfProfile = zdl::DlSystem::PerformanceProfile_t::SYSTEM_SETTINGS;
-    }
-    else if (perfProfileStr == "sustained_high_performance")
-    {
-        PerfProfile = zdl::DlSystem::PerformanceProfile_t::SUSTAINED_HIGH_PERFORMANCE;
-    }
-    else if (perfProfileStr == "burst")
-    {
-        PerfProfile = zdl::DlSystem::PerformanceProfile_t::BURST;
-    }
-    else if (perfProfileStr == "low_power_saver")
-    {
-        PerfProfile = zdl::DlSystem::PerformanceProfile_t::LOW_POWER_SAVER;
-    }
-    else if (perfProfileStr == "high_power_saver")
-    {
-        PerfProfile = zdl::DlSystem::PerformanceProfile_t::HIGH_POWER_SAVER;
-    }
-    else if (perfProfileStr == "low_balanced")
-    {
-        PerfProfile = zdl::DlSystem::PerformanceProfile_t::LOW_BALANCED;
-    }
-    else if (perfProfileStr == "extreme_power_saver")
-    {
-        PerfProfile = zdl::DlSystem::PerformanceProfile_t::EXTREME_POWER_SAVER;
-    }
-    else
-    {
-        std::cerr
-            << "ERROR: Invalid setting pased to the argument --perf_profile.\n "
-               "Please check the Arguments section in the description below\n";
-        return EXIT_FAILURE;
-    }
-
-    std::unique_ptr<zdl::SNPE::SNPE> snpe;
-	auto builderstart = std::chrono::high_resolution_clock::now();
-    snpe = setBuilderOptions(container, runtime, runtimeList,
-	     useUserSuppliedBuffers, platformConfig,
-	     usingInitCaching, cpuFixedPointMode, PerfProfile);
-	auto builderend = std::chrono::high_resolution_clock::now();
-  	auto builderduration = std::chrono::duration_cast<std::chrono::microseconds>(builderend - builderstart);
-	// std::cout << "Time taken to setBuilderOptions: " << builderduration.count() << " microseconds (" << device_to_run << ")" << std::endl;
-    std::cout << "Using the runtime: " << (int) runtime << "(" << device_to_run <<")" << std::endl;
-
-    if (snpe == nullptr)
-    {
-        std::cerr << "Error while building SNPE object." << std::endl;
-        return EXIT_FAILURE;
-    }
-    if (usingInitCaching)
-    {
-        if (container->save(dlc))
-        {
-            std::cout << "Saved container into archive successfully" << std::endl;
-        }
-        else
-        {
-            std::cout << "Failed to save container into archive" << std::endl;
-        }
-    }
-
-    // Configure logging output and start logging. The snpe-diagview
-    // executable can be used to read the content of this diagnostics file
-    auto logger_opt = snpe->getDiagLogInterface();
-    if (!logger_opt)
-        throw std::runtime_error("SNPE failed to obtain logging interface");
-    auto logger = *logger_opt;
-    auto opts = logger->getOptions();
-
-    opts.LogFileDirectory = OutputDir;
-    if (!logger->setOptions(opts))
-    {
-        std::cerr << "Failed to set options" << std::endl;
-        return EXIT_FAILURE;
-    }
-    if (!logger->start())
-    {
-        std::cerr << "Failed to start logger" << std::endl;
-        return EXIT_FAILURE;
-    }
-
-    // Check the batch size for the container
-    // SNPE 1.16.0 (and newer) assumes the first dimension of the tensor shape
-    // is the batch size.
-    zdl::DlSystem::TensorShape tensorShape;
-    tensorShape = snpe->getInputDimensions();
-    size_t batchSize = tensorShape.getDimensions()[0];
-#ifdef ENABLE_GL_BUFFER
-    size_t bufSize = 0;
-    if (userBufferSourceType == GLBUFFER)
-    {
-        if (batchSize > 1)
-        {
-            std::cerr << "GL buffer source mode does not support batchsize larger than 1" << std::endl;
-            return EXIT_FAILURE;
-        }
-        bufSize = calcSizeFromDims(tensorShape.getDimensions(), tensorShape.rank(), sizeof(float));
-    }
-#endif
-    std::cout << "Batch size for the container is " << batchSize << std::endl;
-
-    // Open the input file listing and group input files into batches
-    std::vector<std::vector<std::string>> inputs = preprocessInput(inputFile, batchSize);
-
-    // Load contents of input file batches ino a SNPE tensor or user buffer,
-    // user buffer include cpu buffer and OpenGL buffer,
-    // execute the network with the input and save each of the returned output to a file.
-    if (useUserSuppliedBuffers)
-    {
-        // SNPE allows its input and output buffers that are fed to the network
-        // to come from user-backed buffers. First, SNPE buffers are created from
-        // user-backed storage. These SNPE buffers are then supplied to the network
-        // and the results are stored in user-backed output buffers. This allows for
-        // reusing the same buffers for multiple inputs and outputs.
-        zdl::DlSystem::UserBufferMap inputMap, outputMap;
-        std::vector<std::unique_ptr<zdl::DlSystem::IUserBuffer>> snpeUserBackedInputBuffers, snpeUserBackedOutputBuffers;
-        std::unordered_map<std::string, std::vector<uint8_t>> applicationOutputBuffers;
-
-        if (bufferType == USERBUFFER_TF8 || bufferType == USERBUFFER_TF16)
-        {
-            createOutputBufferMap(outputMap, applicationOutputBuffers, snpeUserBackedOutputBuffers, snpe, true, bitWidth);
-
-            std::unordered_map<std::string, std::vector<uint8_t>> applicationInputBuffers;
-            createInputBufferMap(inputMap, applicationInputBuffers, snpeUserBackedInputBuffers, snpe, true, staticQuantization, bitWidth);
-
-            for (size_t i = 0; i < inputs.size(); i++)
-            {
-                // Load input user buffer(s) with values from file(s)
-                if (batchSize > 1)
-                    std::cout << "Batch " << i << ":" << std::endl;
-                if (!loadInputUserBufferTfN(applicationInputBuffers, snpe, inputs[i], inputMap, staticQuantization, bitWidth, useNativeInputFiles))
-                {
-                    return EXIT_FAILURE;
-                }
-                // Execute the input buffer map on the model with SNPE
-                execStatus = snpe->execute(inputMap, outputMap);
-                // Save the execution results only if successful
-                if (execStatus == true)
-                {
-                    if (!saveOutput(outputMap, applicationOutputBuffers, OutputDir, i * batchSize, batchSize, true, bitWidth))
-                    {
-                        return EXIT_FAILURE;
-                    }
-                }
-                else
-                {
-                    std::cerr << "Error while executing the network." << std::endl;
-                }
-            }
-        }
-        else if (bufferType == USERBUFFER_FLOAT)
-        {
-            createOutputBufferMap(outputMap, applicationOutputBuffers, snpeUserBackedOutputBuffers, snpe, false, bitWidth);
-
-            if (userBufferSourceType == CPUBUFFER || userBufferSourceType == GLBUFFER)
-            {
-                std::unordered_map<std::string, std::vector<uint8_t>> applicationInputBuffers;
-                createInputBufferMap(inputMap, applicationInputBuffers, snpeUserBackedInputBuffers, snpe, false, false, bitWidth);
-
-                for (size_t i = 0; i < inputs.size(); i++)
-                {
-                    // Load input user buffer(s) with values from file(s)
-                    if (batchSize > 1)
-                        std::cout << "Batch " << i << ":" << std::endl;
-                    if (!loadInputUserBufferFloat(applicationInputBuffers, snpe, inputs[i]))
-                    {
-                        return EXIT_FAILURE;
-                    }
-                    // Execute the input buffer map on the model with SNPE
-                    execStatus = snpe->execute(inputMap, outputMap);
-                    // Save the execution results only if successful
-                    if (execStatus == true)
-                    {
-                        if (!saveOutput(outputMap, applicationOutputBuffers, OutputDir, i * batchSize, batchSize, false, bitWidth))
-                        {
-                            return EXIT_FAILURE;
-                        }
-                    }
-                    else
-                    {
-                        std::cerr << "Error while executing the network." << std::endl;
-                    }
-                }
-            }
-        }
-    }
-    else if (bufferType == ITENSOR)
-    {
-        // A tensor map for SNPE execution outputs
-        zdl::DlSystem::TensorMap outputTensorMap;
-        // Get input names and number
-        const auto &inputTensorNamesRef = snpe->getInputTensorNames();
-        if (!inputTensorNamesRef)
-            throw std::runtime_error("Error obtaining Input tensor names");
-        const auto &inputTensorNames = *inputTensorNamesRef;
-
-        for (size_t i = 0; i < inputs.size(); i++)
-        {
-            // Load input/output buffers with ITensor
-            if (batchSize > 1)
-                std::cout << "Batch " << i << ":" << std::endl;
-            if (inputTensorNames.size() == 1)
-            {
-                // Load input/output buffers with ITensor
-                std::unique_ptr<zdl::DlSystem::ITensor> inputTensor = loadInputTensor(snpe, inputs[i], inputTensorNames);
-                if (!inputTensor)
-                {
-                    return EXIT_FAILURE;
-                }
-                // Execute the input tensor on the model with SNPE
-	auto executestart = std::chrono::high_resolution_clock::now();
-                execStatus = snpe->execute(inputTensor.get(), outputTensorMap);
-	auto executeend = std::chrono::high_resolution_clock::now();
-  	auto executeduration = std::chrono::duration_cast<std::chrono::microseconds>(executeend - executestart);
-	std::cout << "Time taken to execute: " << executeduration.count() << " microseconds" << std::endl;
-            }
-            else
-            {
-                std::vector<std::unique_ptr<zdl::DlSystem::ITensor>> inputTensors(inputTensorNames.size());
-                zdl::DlSystem::TensorMap inputTensorMap;
-                bool inputLoadStatus = false;
-                // Load input/output buffers with TensorMap
-                std::tie(inputTensorMap, inputLoadStatus) = loadMultipleInput(snpe, inputs[i], inputTensorNames, inputTensors);
-                if (!inputLoadStatus)
-                {
-                    return EXIT_FAILURE;
-                }
-                // Execute the multiple input tensorMap on the model with SNPE
-                execStatus = snpe->execute(inputTensorMap, outputTensorMap);
-            }
-            // Save the execution results if execution successful
-            if (execStatus == true)
-            {
-                if (!saveOutput(outputTensorMap, OutputDir, i * batchSize, batchSize))
-                {
-                    return EXIT_FAILURE;
-                }
-            }
-            else
-            {
-                std::cerr << "Error while executing the network." << std::endl;
-            }
-        }
-    }
-    // Freeing of snpe object
-
-    // Terminate Logging
-    zdl::SNPE::SNPEFactory::terminateLogging();
-
-	auto end = std::chrono::high_resolution_clock::now();
-  	auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-	std::cout << "Total time taken: " << duration.count() << " microseconds for " << device_to_run << std::endl;
-
-    snpe.reset();
-    return SUCCESS;
+    return loadInputTensor(snpe, batches[0], names);
 }
 
-void central_queue_to_device_queue() {
-
-/*
- * Runs till the central_request_queue is empty
- * For each entry in the central queue, check the pending time for the current requests in the CPU/GPU/NPU queue
- * Dispatch the entry from the central queue into the device queue that has the lowest pending time
- */
-
-	while(true) {
-		central_request_queue_mutex.lock();
-		if (central_request_queue.empty()) {
-			break;
-		} else {
-			eachRequest front_request = central_request_queue.front();
-			central_request_queue.pop();
-			central_request_queue_mutex.unlock();
-
-			cpu_request_queue_mutex.lock();gpu_request_queue_mutex.lock();dsp_request_queue_mutex.lock();
-			// TODO: hardcoding these times for the inception model. Need to add an array to check front_request.dlc thingy to check
-			float cpu_pending_time = cpu_request_queue.size()*6e5;
-			float gpu_pending_time = gpu_request_queue.size()*12e5;
-			float dsp_pending_time = dsp_request_queue.size()*14e5;
-			    if (cpu_pending_time <= gpu_pending_time && cpu_pending_time <= dsp_pending_time) {
-				cpu_request_queue.push(front_request);
-				std::cout << "CPU/GPU/NPU pending times: " << cpu_pending_time << "<- " << gpu_pending_time << " " << dsp_pending_time << std::endl;
-			    } else if (gpu_pending_time <= cpu_pending_time && gpu_pending_time <= dsp_pending_time) {
-				gpu_request_queue.push(front_request);
-				std::cout << "CPU/GPU/NPU pending times: " << cpu_pending_time << " " << gpu_pending_time << "<- " << dsp_pending_time << std::endl;
-			    } else {
-				dsp_request_queue.push(front_request);
-				std::cout << "CPU/GPU/NPU pending times: " << cpu_pending_time << " " << gpu_pending_time << " " << dsp_pending_time << "<-" << std::endl;
-			    }
-			cpu_request_queue_mutex.unlock();gpu_request_queue_mutex.unlock();dsp_request_queue_mutex.unlock();
-		}
-	}
-}
-
-void cpu_dispatch() {
-	/*
-	 * Run till the cpu_request_queue is empty and dispatch each request to the cpu 
-	 */
-	while(true) { // run till cpu_request_queue has elements
-		cpu_request_queue_mutex.lock();
-		if (cpu_request_queue.empty()) {
-			cpu_request_queue_mutex.unlock();
-			break;
-		} else {
-			eachRequest frontRequest = cpu_request_queue.front();
-			cpu_request_queue.pop();
-			cpu_request_queue_mutex.unlock();
-			dispatch("cpu", frontRequest);
-			// TODO: depending on what request you just handled, add another request to the central queue for the multi-model chaining
-		}
-	}
-}
-
-void gpu_dispatch() {
-	/*
-	 * Run till the gpu_request_queue is empty and dispatch each request to the gpu
-	 */
-	while(true) { // run till gpu_request_queue has elements
-		gpu_request_queue_mutex.lock();
-		if (gpu_request_queue.empty()) {
-			gpu_request_queue_mutex.unlock();
-			break;
-		} else {
-			eachRequest frontRequest = gpu_request_queue.front();
-			gpu_request_queue.pop();
-			gpu_request_queue_mutex.unlock();
-			dispatch("gpu", frontRequest);
-			// TODO: depending on what request you just handled, add another request to the central queue for the multi-model chaining
-		}
-	}
-}
-
-void dsp_dispatch() {
-	/*
-	 * Run till the dsp_request_queue is empty and dispatch each request to the dsp
-	 */
-	while(true) { // run till dsp_request_queue has elements
-		dsp_request_queue_mutex.lock();
-		if (dsp_request_queue.empty()) {
-			dsp_request_queue_mutex.unlock();
-			break;
-		} else {
-			eachRequest frontRequest = dsp_request_queue.front();
-			dsp_request_queue.pop();
-			dsp_request_queue_mutex.unlock();
-			dispatch("dsp", frontRequest);
-			// TODO: depending on what request you just handled, add another request to the central queue for the multi-model chaining
-		}
-	}
-}
-
-int main(int argc, char **argv)
+/* preload DLCs once (with Init‑Caching) ------------------------------------------ */
+static void preload()
 {
+    std::set<std::string> dlcs;
+    for(auto& kv:kScenarios) for(auto& m:kv.second) dlcs.insert(m.dlc);
 
-	std::string device_to_run = "cpu";
-    enum
+    std::cout<<"\n=== Pre‑loading "<<dlcs.size()<<" unique DLCs ===\n";
+    for(const auto& dlc:dlcs)
     {
-        UNKNOWN,
-        USERBUFFER_FLOAT,
-        USERBUFFER_TF8,
-        ITENSOR,
-        USERBUFFER_TF16
-    };
-    enum
-    {
-        CPUBUFFER,
-        GLBUFFER
-    };
+        std::cout<<"• "<<dlc<<": ";
+        const ModelSpec* anySpec=nullptr;
+        for(auto& kv:kScenarios) for(const auto& m:kv.second)
+            if(m.dlc==dlc){ anySpec=&m; break; }
+        if(!anySpec || !exists(dlc)){ std::cout<<"<file missing>\n"; continue; }
 
+        auto& mc = gModelCtx[dlc];
+        std::vector<const char*> ok;
 
-#ifdef __ANDROID__
-    // Initialize Logs with level LOG_ERROR.
+        for(Runtime_t rt:{Runtime_t::CPU,Runtime_t::GPU,Runtime_t::DSP}){
+            if(!zdl::SNPE::SNPEFactory::isRuntimeAvailable(rt)) continue;
+
+            RtCtx ctx;
+            if(auto cont = loadContainerFromFile(dlc)){
+                zdl::DlSystem::PlatformConfig pc;
+                ctx.snpe = setBuilderOptions(cont, rt, {}, false, pc,
+                                             /*InitCache*/true,false,
+                                             zdl::DlSystem::PerformanceProfile_t::HIGH_PERFORMANCE);
+                if(ctx.snpe){
+                    cont->save(dlc.c_str());               // create / update cache
+                    try{ ctx.input = prepInput(ctx.snpe, anySpec->list); }
+                    catch(...){ ctx.snpe.reset(); }
+                }
+            }
+            if(ctx.snpe){
+                mc.rt[int(rt)] = std::move(ctx);
+                gAvailRt[dlc].push_back(rt);
+                ok.push_back(rtName(rt));
+            }
+        }
+        if(ok.empty()) std::cout<<"<no runtime>";
+        else           for(size_t i=0;i<ok.size();++i) std::cout<<ok[i]<<(i+1==ok.size()?"":",");
+        std::cout<<"\n";
+    }
+    std::cout<<"===========================================\n";
+}
+
+/* worker thread ------------------------------------------------------------------ */
+static void worker(Runtime_t rt,int core)
+{
+    pin(core);
+    for(Request rq; !gStop && queues[int(rt)].pop(rq); ){
+        const RtCtx& ctx = gModelCtx[rq.ms->dlc].rt[int(rt)];
+        if(!ctx.snpe){                            // runtime not available after all
+            if(Clock::now()>rq.dl) ;              // miss counted in drain
+            continue;
+        }
+        gInFlight++;
+        auto t0 = Clock::now();
+        zdl::DlSystem::TensorMap om;
+        ctx.snpe->execute(ctx.input.get(), om);
+        auto t1 = Clock::now();
+        gInFlight--;
+        gLat[rq.ms->dlc][int(rt)].upd(
+            std::chrono::duration<double,std::milli>(t1-t0).count());
+    }
+}
+
+/* selectors ---------------------------------------------------------------------- */
+static Runtime_t pickJSQ(const std::vector<Runtime_t>& rts)
+{
+    Runtime_t best=rts[0]; size_t bq=queues[int(best)].size();
+    auto pref = {Runtime_t::DSP,Runtime_t::GPU,Runtime_t::CPU};
+    for(Runtime_t rt:rts){
+        size_t q=queues[int(rt)].size();
+        if(q<bq || (q==bq &&
+           std::find(pref.begin(),pref.end(),rt)<std::find(pref.begin(),pref.end(),best)))
+        { best=rt; bq=q; }
+    }
+    return best;
+}
+static Runtime_t pickDyn(const ModelSpec& m,const std::vector<Runtime_t>&rts,double slack)
+{
+    for(Runtime_t pref:{Runtime_t::DSP,Runtime_t::GPU,Runtime_t::CPU}){
+        if(std::find(rts.begin(),rts.end(),pref)==rts.end()) continue;
+        double qLat = queues[int(pref)].size()*gLat[m.dlc][int(pref)].avg;
+        if(qLat <= slack) return pref;
+    }
+    return pickJSQ(rts);
+}
+
+/* run one scenario / scale / policy ---------------------------------------------- */
+static double runOne(const Scenario& S, Policy pol, double scale,
+                     std::chrono::seconds dur, std::mt19937& rng)
+{
+    for(auto& q:queues) q.clear();
+
+    struct St{ const ModelSpec* ms; Clock::duration per; Clock::time_point next;
+               std::bernoulli_distribution bern; };
+    std::vector<St> st;
+    auto start = Clock::now();
+    for(auto& m:S){
+        st.push_back({ &m,
+                       std::chrono::duration_cast<Clock::duration>(
+                           std::chrono::duration<double>(1.0/(m.fps*scale))),
+                       start,
+                       std::bernoulli_distribution(m.prob) });
+    }
+    const auto endTime = start + dur;
+    uint64_t total=0, miss=0;
+
+    std::uniform_int_distribution<int> randPick;  // re‑set per use
+
+    while(Clock::now() < endTime){
+        auto now = Clock::now();
+        for(auto& s : st){
+            if(now >= s.next){
+                s.next += s.per;
+                if(!s.bern(rng)) continue;
+
+                const auto& rts = gAvailRt[s.ms->dlc];
+                if(rts.empty()) continue;
+
+                Runtime_t tgt = Runtime_t::CPU;
+                switch(pol){
+                    case Policy::CPU_ONLY:
+                        tgt = (std::find(rts.begin(),rts.end(),Runtime_t::CPU)!=rts.end())
+                              ? Runtime_t::CPU : rts[0]; break;
+                    case Policy::GPU_ONLY:
+                        tgt = (std::find(rts.begin(),rts.end(),Runtime_t::GPU)!=rts.end())
+                              ? Runtime_t::GPU : rts[0]; break;
+                    case Policy::DSP_ONLY:
+                        tgt = (std::find(rts.begin(),rts.end(),Runtime_t::DSP)!=rts.end())
+                              ? Runtime_t::DSP : rts[0]; break;
+                    case Policy::RANDOM:
+                        randPick.param(std::uniform_int_distribution<int>::param_type(0,int(rts.size())-1));
+                        tgt = rts[randPick(rng)]; break;
+                    case Policy::JSQ:
+                        tgt = pickJSQ(rts); break;
+                    case Policy::DYNAMIC:{
+                        double slack = std::chrono::duration<double,std::milli>(s.per).count();
+                        tgt = pickDyn(*s.ms, rts, slack);
+                    } break;
+                }
+                queues[int(tgt)].push({s.ms,tgt,now+s.per});
+                ++total;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    /* drain with watchdog (max 3 s) */
+    auto wdEnd = Clock::now() + std::chrono::seconds(3);
+    while((gInFlight.load()>0 ||
+           std::any_of(std::begin(queues),std::end(queues),
+                       [](TSQueue&q){return q.size();}))
+           && Clock::now() < wdEnd)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+    /* anything still sitting in queues is an automatic miss */
+    for(auto& q:queues){
+        std::lock_guard<std::mutex> lk(q.m);
+        while(!q.q.empty()){ if(Clock::now()>q.q.front().dl) ++miss; q.q.pop(); }
+    }
+    return total ? 100.0*double(miss)/double(total) : 0.0;
+}
+
+/* main --------------------------------------------------------------------------- */
+int main()
+{
+    const std::chrono::seconds simDur(15);
+    std::mt19937 rng{std::random_device{}()};
+
     zdl::SNPE::SNPEFactory::initializeLogging(zdl::DlSystem::LogLevel_t::LOG_ERROR);
-#else
-    // Initialize Logs with specified log level as LOG_ERROR and log path as "./Log".
-    zdl::SNPE::SNPEFactory::initializeLogging(zdl::DlSystem::LogLevel_t::LOG_ERROR, "./Log");
-#endif
+    preload();
 
-    // Update Log Level to LOG_WARN.
-    zdl::SNPE::SNPEFactory::setLogLevel(zdl::DlSystem::LogLevel_t::LOG_WARN);
+    std::thread cpuT(worker, Runtime_t::CPU, 0);
+    std::thread gpuT(worker, Runtime_t::GPU, 1);
+    std::thread dspT(worker, Runtime_t::DSP, 2);
 
-    // Process command line arguments
-    int opt = 0;
-#ifndef _WIN32
-    while ((opt = getopt(argc, argv, "hi:d:o:b:q:s:z:r:l:u:cx:p:n")) != -1)
-#else
-    enum OPTIONS
-    {
-        OPT_HELP = 'h',
-        OPT_CONTAINER = 'd',
-        OPT_INPUT_LIST = 'i',
-        OPT_OUTPUT_DIR = 'o',
-        OPT_USERBUFFER = 'b',
-        OPT_RUNTIME = 'r',
-        OPT_RESIZABLE_DIM = 'z',
-        OPT_INITBLOBSCACHE = 'c',
-        OPT_RUNTIME_ORDER = 'l',
-        OPT_STATIC_QUANTIZATION = 'q',
-        OPT_UDO_PACKAGE_PATH = 'u',
-        OPT_BUFF_SOURCE = 's',
-        OPT_CPU_FXP = 'x',
-        OPT_NATIVE_INPUT = 'n',
-        OPT_PERF_PROFILE = 'p'
-    };
-    static struct WinOpt::option long_options[] = {
-        {"h", WinOpt::no_argument, NULL, OPT_HELP},
-        {"d", WinOpt::required_argument, NULL, OPT_CONTAINER},
-        {"i", WinOpt::required_argument, NULL, OPT_INPUT_LIST},
-        {"o", WinOpt::required_argument, NULL, OPT_OUTPUT_DIR},
-        {"b", WinOpt::required_argument, NULL, OPT_USERBUFFER},
-        {"r", WinOpt::required_argument, NULL, OPT_RUNTIME},
-        {"z", WinOpt::required_argument, NULL, OPT_RESIZABLE_DIM},
-        {"c", WinOpt::no_argument, NULL, OPT_INITBLOBSCACHE},
-        {"l", WinOpt::required_argument, NULL, OPT_RUNTIME_ORDER},
-        {"q", WinOpt::required_argument, NULL, OPT_STATIC_QUANTIZATION},
-        {"x", WinOpt::no_argument, NULL, OPT_CPU_FXP},
-        {"u", WinOpt::required_argument, NULL, OPT_UDO_PACKAGE_PATH},
-        {"s", WinOpt::required_argument, NULL, OPT_BUFF_SOURCE},
-        {"n", WinOpt::no_argument, NULL, OPT_NATIVE_INPUT},
-        {"p", WinOpt::required_argument, NULL, OPT_PERF_PROFILE},
-        {NULL, 0, NULL, 0}};
-    int long_index = 0;
-    while ((opt = WinOpt::GetOptLongOnly(argc, argv, "", long_options, &long_index)) != -1)
-#endif
-    {
-        switch (opt)
-        {
-        case 'h':
-            std::cout
-                << "\nDESCRIPTION:\n"
-                << "------------\n"
-                << "Example application demonstrating how to load and execute a neural network\n"
-                << "using the SNPE C++ API.\n"
-                << "\n\n"
-                << "REQUIRED ARGUMENTS:\n"
-                << "-------------------\n"
-                << "  -d  <FILE>   Path to the DL container containing the network.\n"
-                << "  -i  <FILE>   Path to a file listing the inputs for the network.\n"
-                << "  -o  <PATH>   Path to directory to store output results.\n"
-                << "\n"
-                << "OPTIONAL ARGUMENTS:\n"
-                << "-------------------\n"
-                << "  -b  <TYPE>   Type of buffers to use [USERBUFFER_FLOAT, USERBUFFER_TF8, ITENSOR, USERBUFFER_TF16] (" << bufferTypeStr << " is default).\n"
-                << "  -q  <BOOL>    Specifies to use static quantization parameters from the model instead of input specific quantization [true, false]. Used in conjunction with USERBUFFER_TF8. \n"
-                << "  -r  <RUNTIME> The runtime to be used [gpu, dsp, aip, cpu] (cpu is default). \n"
-                << "  -u  <VAL,VAL> Path to UDO package with registration library for UDOs. \n"
-                << "                Optionally, user can provide multiple packages as a comma-separated list. \n"
-                << "  -z  <NUMBER>  The maximum number that resizable dimensions can grow into. \n"
-                << "                Used as a hint to create UserBuffers for models with dynamic sized outputs. Should be a positive integer and is not applicable when using ITensor. \n"
-#ifdef ENABLE_GL_BUFFER
-                << "  -s  <TYPE>   Source of user buffers to use [GLBUFFER, CPUBUFFER] (" << userBufferSourceStr << " is default).\n"
-#endif
-                << "  -c           Enable init caching to accelerate the initialization process of SNPE. Defaults to disable.\n"
-                << "  -l  <VAL,VAL,VAL> Specifies the order of precedence for runtime e.g  cpu_float32, dsp_fixed8_tf etc. Valid values are:- \n"
-                << "                    cpu_float32 (Snapdragon CPU)       = Data & Math: float 32bit \n"
-                << "                    gpu_float32_16_hybrid (Adreno GPU) = Data: float 16bit Math: float 32bit \n"
-                << "                    dsp_fixed8_tf (Hexagon DSP)        = Data & Math: 8bit fixed point Tensorflow style format \n"
-                << "                    gpu_float16 (Adreno GPU)           = Data: float 16bit Math: float 16bit \n"
-#if DNN_RUNTIME_HAVE_AIP_RUNTIME
-                << "                    aip_fixed8_tf (Snapdragon HTA+HVX) = Data & Math: 8bit fixed point Tensorflow style format \n"
+    std::ofstream csv("results.csv"); csv<<std::unitbuf;
+    csv<<"scenario,scale,policy,miss_rate\n";
 
-#endif
-                << "                    cpu (Snapdragon CPU)               = Same as cpu_float32 \n"
-                << "                    gpu (Adreno GPU)                   = Same as gpu_float32_16_hybrid \n"
-                << "                    dsp (Hexagon DSP)                  = Same as dsp_fixed8_tf \n"
-#if DNN_RUNTIME_HAVE_AIP_RUNTIME
-                << "                    aip (Snapdragon HTA+HVX)           = Same as aip_fixed8_tf \n"
-#endif
-                << "  -x            Specifies to use the fixed point execution on CPU runtime for quantized DLC.\n"
-                << "                Used in conjunction with CPU runtime.\n"
-                << "  -n            Specifies to consume the input file(s) in their native data types. \n"
-                << "  -p <TYPE>     Specifies perf profile to set. Valid settings are \"low_balanced\" , \"balanced\" , \"default\",\n"
-                << "\"high_performance\" ,\"sustained_high_performance\", \"burst\", \"low_power_saver\", \"power_saver\",\n"
-                << "\"high_power_saver\", \"extreme_power_saver\", and \"system_settings\"."
-                << std::endl;
-
-            std::exit(SUCCESS);
-        case 'i':
-            // inputFile = optarg;
-            break;
-        case 'd':
-            // dlc = optarg;
-            break;
-        case 'o':
-            OutputDir = optarg;
-            break;
-        case 'b':
-            bufferTypeStr = optarg;
-            break;
-        case 'q':
-            staticQuantizationStr = optarg;
-            break;
-        case 's':
-            userBufferSourceStr = optarg;
-            break;
-        case 'z':
-            setResizableDim(atoi(optarg));
-            break;
-        case 'r':
-            runtimeSpecified = true;
-            break;
-
-        case 'l':
-        {
-            std::string inputString = optarg;
-            // std::cout<<"Input String: "<<inputString<<std::endl;
-            std::vector<std::string> runtimeStrVector;
-            split(runtimeStrVector, inputString, ',');
-
-            // Check for dups
-            for (auto it = runtimeStrVector.begin(); it != runtimeStrVector.end() - 1; it++)
+    for(const auto& sc : kScenarios){
+        for(double scf : kScales){
+            std::cout<<"\n>>> Scenario \""<<sc.first<<"\"   scale="<<scf<<"\n";
+            for(Policy p : {Policy::CPU_ONLY,Policy::GPU_ONLY,Policy::DSP_ONLY,
+                            Policy::RANDOM,Policy::JSQ,Policy::DYNAMIC})
             {
-                auto found = std::find(it + 1, runtimeStrVector.end(), *it);
-                if (found != runtimeStrVector.end())
-                {
-                    // std::cerr << "Error: Invalid values passed to the argument " << argv[optind - 2] << ". Duplicate entries in runtime order" << std::endl;
-                    std::exit(FAILURE);
-                }
+                std::cout<<"   "<<kPolName[int(p)]<<" ... "<<std::flush;
+                double miss = runOne(sc.second, p, scf, simDur, rng);
+                std::cout<<miss<<"%\n";
+                csv<<sc.first<<','<<scf<<','<<kPolName[int(p)]<<','<<miss<<'\n';
             }
-
-            runtimeList.clear();
-            for (auto &runtimeStr : runtimeStrVector)
-            {
-                // std::cout<<runtimeStr<<std::endl;
-                zdl::DlSystem::Runtime_t eachruntime = zdl::DlSystem::RuntimeList::stringToRuntime(runtimeStr.c_str());
-                if (eachruntime != zdl::DlSystem::Runtime_t::UNSET)
-                {
-                    bool ret = runtimeList.add(eachruntime);
-                    if (ret == false)
-                    {
-                        std::cerr << zdl::DlSystem::getLastErrorString() << std::endl;
-                        // std::cerr << "Error: Invalid values passed to the argument " << argv[optind - 2] << ". Please provide comma seperated runtime order of precedence" << std::endl;
-                        std::exit(FAILURE);
-                    }
-                }
-                else
-                {
-                    // std::cerr << "Error: Invalid values passed to the argument " << argv[optind - 2] << ". Please provide comma seperated runtime order of precedence" << std::endl;
-                    std::exit(FAILURE);
-                }
-            }
-        }
-        break;
-
-        case 'c':
-            usingInitCaching = true;
-            break;
-        case 'u':
-            UdoPackagePath = optarg;
-            break;
-        case 'x':
-            cpuFixedPointMode = true;
-            break;
-        case 'n':
-            useNativeInputFiles = true;
-            break;
-        case 'p':
-            perfProfileStr = optarg;
-            break;
-        default:
-            std::cout << "Invalid parameter specified. Please run snpe-sample with the -h flag to see required arguments" << std::endl;
-            std::exit(FAILURE);
         }
     }
 
+    gStop = true; for(auto& q:queues) q.cv.notify_all();
+    cpuT.join(); gpuT.join(); dspT.join();
 
-	// Populating the central_request_queue with a few requests to start with
-	central_request_queue_mutex.lock();
-	for (int i = 0; i < 30; i++) {
-		eachRequest inception_request = {i, "inception_v3_quantized.dlc", "target_raw_list.txt"};	
-		central_request_queue.push(inception_request);
-	}
-	central_request_queue_mutex.unlock();
-
-	// Start the thread that takes requests from the central queue to dispatch it to the device queues
-	std::thread central_to_device_thread(central_queue_to_device_queue);
-	std::this_thread::sleep_for(std::chrono::milliseconds(2000)); // Giving this thread some time to be able to populate the device queues
-
-	std::thread cpu_dispatch_thread(cpu_dispatch);
-	std::thread gpu_dispatch_thread(gpu_dispatch);
-	std::thread dsp_dispatch_thread(dsp_dispatch);
-
-	// TODO: have to add another thread that keeps adding requests to the central queue at a constant rate
-
-	central_to_device_thread.join();
-	cpu_dispatch_thread.join();
-	gpu_dispatch_thread.join();
-	dsp_dispatch_thread.join();
-
-
+    std::cout<<"\nAll results written to results.csv\n";
+    return 0;
 }
-
